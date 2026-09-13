@@ -1,0 +1,38 @@
+{
+  "name": "deepseek-whale-widget",
+  "version": "1.0.0",
+  "description": "DeepSeek 余额小鲸鱼挂件：屏幕角落常驻的余额 / 今日已用 / 每轮消耗监控",
+  "author": {
+    "name": "Port of MeteorNOX/DeepSeek-Balance-Whale-Widget"
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "balance",
+    "widget",
+    "whale",
+    "desktop",
+    "usage"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "DeepSeek 小鲸鱼挂件",
+    "shortDescription": "屏幕角落的小鲸鱼，盯着你的 DeepSeek 余额与消耗",
+    "longDescription": "把 DSH 版「DeepSeek-Balance-Whale-Widget」的外观与交互搬到 Windows 桌面：小鲸鱼立绘 + 代码绘制的对话气泡，显示账户余额、今日已用与每轮对话消耗。支持拖拽、四边四分之一吸附、左吸附镜像翻转、按压 Q 弹、余额数字滚动、随机台词气泡、gif 动图与音效，以及汉堡菜单（大小 / 音效 / 音量 / 用量模式 / 气泡开关）。每轮消耗直接读 Codex 会话日志里的真实 usage，按 DeepSeek 官方峰谷单价换算，不是估算。立绘、gif 与音效沿用上游 MIT 许可的原始素材。",
+    "developerName": "Port of MeteorNOX",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "把 DeepSeek 小鲸鱼挂件放出来",
+      "看看 DeepSeek 余额和今日已用",
+      "上一轮对话花了多少钱"
+    ],
+    "brandColor": "#203170",
+    "composerIcon": "./assets/DSniang1.png",
+    "logo": "./assets/DSniang1.png"
+  }
+}

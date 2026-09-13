@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "deepseek-whale": {
+      "command": "node",
+      "args": ["./scripts/whale.mjs", "mcp"],
+      "cwd": ".",
+      "env_vars": [
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_WHALE_DIR",
+        "CODEX_HOME",
+        "USERPROFILE",
+        "HOME"
+      ],
+      "tool_timeout_sec": 60
+    }
+  }
+}
