@@ -44,7 +44,7 @@ function widgetPid(dataDir) {
   }
 }
 
-function startWidget({ dataDir, assetDir, quiet }) {
+function startWidget({ dataDir, assetDir, quiet, follow }) {
   const dir = resolveDataDir(dataDir);
   const existing = widgetPid(dir);
   if (existing) return { started: false, pid: existing, reason: "已在运行" };
@@ -57,6 +57,8 @@ function startWidget({ dataDir, assetDir, quiet }) {
   let cmdline = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${WIDGET}" -DataDir "${dir}"`;
   if (assetDir) cmdline += ` -AssetDir "${assetDir}"`;
   if (quiet) cmdline += " -Quiet";
+  // -FollowCodex：挂件自己盯着 Codex 进程，Codex 退出后自动收起
+  if (follow) cmdline += " -FollowCodex";
 
   const script =
     `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${
@@ -73,6 +75,48 @@ function startWidget({ dataDir, assetDir, quiet }) {
     fs.writeFileSync(path.join(dir, "widget.pid"), String(pid), "utf8");
   } catch {}
   return { started: true, pid };
+}
+
+// 收起挂件：写停止信号，挂件每 300ms 检查一次，收到后走正常关闭流程
+// （位置与设置都会被保存），等不到再强制结束。
+async function stopWidget({ dataDir, waitMs = 6000 }) {
+  const dir = resolveDataDir(dataDir);
+  const pid = widgetPid(dir);
+  const stopFile = path.join(dir, "whale-stop");
+  if (!pid) {
+    try {
+      fs.rmSync(stopFile, { force: true });
+    } catch {}
+    return { stopped: false, reason: "未在运行" };
+  }
+  try {
+    fs.writeFileSync(stopFile, "stop", "utf8");
+  } catch {}
+  const deadline = Date.now() + waitMs;
+  let alive = true;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+      break;
+    }
+  }
+  let forced = false;
+  if (alive) {
+    try {
+      process.kill(pid);
+      forced = true;
+    } catch {}
+  }
+  try {
+    fs.rmSync(stopFile, { force: true });
+  } catch {}
+  try {
+    fs.rmSync(path.join(dir, "widget.pid"), { force: true });
+  } catch {}
+  return { stopped: true, pid, forced };
 }
 
 async function snapshot(dataDir) {
@@ -162,7 +206,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["start", "status"], description: "默认 status。" },
+        action: { type: "string", enum: ["start", "stop", "status"], description: "默认 status。" },
         dataDir: { type: "string", description: "数据目录。" },
       },
       additionalProperties: false,
@@ -173,6 +217,13 @@ const TOOLS = [
         const r = startWidget({ dataDir: dir });
         return {
           text: r.started ? `小鲸鱼挂件已启动（pid ${r.pid}）` : `挂件已在运行（pid ${r.pid}）`,
+          structured: r,
+        };
+      }
+      if (args.action === "stop") {
+        const r = await stopWidget({ dataDir: dir });
+        return {
+          text: r.stopped ? `小鲸鱼挂件已收起（pid ${r.pid}）` : "挂件未在运行",
           structured: r,
         };
       }
@@ -235,7 +286,38 @@ async function handleMcp(message) {
   }
 }
 
+function logMcp(dir, message) {
+  try {
+    fs.appendFileSync(
+      path.join(dir, "mcp.log"),
+      `[${new Date().toISOString()}] ${message}\n`,
+      "utf8",
+    );
+  } catch {}
+}
+
+// Codex 每个会话都会拉起这个 MCP 服务，"服务被启动"就是"Codex 打开了"的天然信号。
+// 所以这里不需要注册任何开机自启：只有 Codex 真的开着才放出挂件。
+// 挂件带 -FollowCodex，Codex 退出后它会自己收起。
+function ensureWidgetForCodex() {
+  try {
+    const dir = resolveDataDir();
+    if (loadConfig(dir).followCodex === false) {
+      logMcp(dir, "followCodex 已关闭，不自动放出挂件");
+      return;
+    }
+    if (widgetPid(dir)) return; // 已经在跑了
+    const r = startWidget({ dataDir: dir, follow: true });
+    logMcp(dir, r.started ? `已放出挂件 pid=${r.pid}` : `未启动：${r.reason ?? "已在运行"}`);
+  } catch (error) {
+    try {
+      logMcp(resolveDataDir(), `放出挂件失败：${error?.message ?? error}`);
+    } catch {}
+  }
+}
+
 function runMcp() {
+  ensureWidgetForCodex();
   const rl = readline.createInterface({ input: process.stdin });
   rl.on("line", (line) => {
     const trimmed = line.trim();
@@ -315,9 +397,18 @@ async function main() {
       process.stdout.write(r.started ? `小鲸鱼挂件已启动（pid ${r.pid}）\n` : `挂件已在运行（pid ${r.pid}）\n`);
       return;
     }
+    case "stop": {
+      const r = await stopWidget({ dataDir });
+      process.stdout.write(
+        r.stopped
+          ? `小鲸鱼挂件已收起（pid ${r.pid}${r.forced ? "，未响应，已强制结束" : ""}）\n`
+          : "小鲸鱼挂件未在运行\n",
+      );
+      return;
+    }
     case "config": {
       const patch = {};
-      for (const key of ["scale", "sound", "vol", "soundSet", "usageMode", "peakMode", "bubbleOn", "turnCostOn"]) {
+      for (const key of ["scale", "sound", "vol", "soundSet", "usageMode", "peakMode", "bubbleOn", "turnCostOn", "followCodex", "quitHotkey"]) {
         const v = flag(key);
         if (v !== undefined) patch[key] = v === "true" ? true : v === "false" ? false : Number.isNaN(Number(v)) ? v : Number(v);
       }
@@ -327,7 +418,7 @@ async function main() {
     }
     default:
       process.stdout.write(
-        "用法：node scripts/whale.mjs <balance|today|last-turn|start|status|config|mcp> [--data-dir <dir>] [--json]\n",
+        "用法：node scripts/whale.mjs <balance|today|last-turn|start|stop|status|config|mcp> [--data-dir <dir>] [--json]\n",
       );
   }
 }

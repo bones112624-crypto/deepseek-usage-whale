@@ -25,6 +25,10 @@ param(
   [switch]$RenderBubble,    # 调试用：渲染时把气泡打开
   [switch]$RenderFlip,      # 调试用：渲染左吸附镜像态
   [switch]$TestOpenPanel,   # 调试用：只跑一次"右键打开面板"的服务启动逻辑后退出
+  [switch]$FollowCodex,     # 由 Codex 的 MCP 服务拉起时带上：Codex 退出后自动收起
+  [string]$CodexProcessName = 'ChatGPT',        # 跟随模式下用来识别 Codex 的进程名
+  [string]$CodexPathFilter = '*OpenAI.Codex_*', # 再按路径筛一次，避免认错同名进程
+  [string]$QuitHotkey,                          # 退出快捷键；不传就用 config.json 里的 quitHotkey
   [switch]$Quiet
 )
 
@@ -84,6 +88,27 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
+# 把 "Ctrl+Shift+Z" 这类写法解析成 RegisterHotKey 需要的修饰键位+虚拟键码。
+# 认不出来或者没有任何修饰键时返回 $null（调用方会记一条日志并跳过注册）。
+function Parse-QuitHotkey {
+  param([string]$Text)
+  if (-not $Text) { return $null }
+  $mods = 0
+  $vk = 0
+  foreach ($raw in ($Text -split '\+')) {
+    $t = $raw.Trim()
+    if ($t -match '^(?i)(ctrl|control)$') { $mods = $mods -bor 0x0002 }
+    elseif ($t -match '^(?i)shift$') { $mods = $mods -bor 0x0004 }
+    elseif ($t -match '^(?i)alt$') { $mods = $mods -bor 0x0001 }
+    elseif ($t -match '^(?i)win$') { $mods = $mods -bor 0x0008 }
+    elseif ($t -match '^[A-Za-z]$') { $vk = [int][char]$t.ToUpper() }
+    elseif ($t -match '^[0-9]$') { $vk = [int][char]$t }
+    else { return $null }
+  }
+  if ($mods -eq 0 -or $vk -eq 0) { return $null }
+  return [pscustomobject]@{ Mods = $mods; Vk = $vk }
+}
+
 $defaults = [ordered]@{
   scale           = 1.5
   sound           = $true
@@ -94,6 +119,8 @@ $defaults = [ordered]@{
   bubbleOn        = $true
   turnCostOn      = $true
   turnCostCloseSec = 5
+  followCodex     = $true      # 由 Codex 的 MCP 服务拉起时跟随 Codex 启停
+  quitHotkey      = 'Ctrl+Shift+Z'   # 退出快捷键，留空字符串可禁用
   x               = $null
   y               = $null
 }
@@ -114,11 +141,31 @@ function Read-Config {
 
 function Save-Config {
   try {
-    [System.IO.File]::WriteAllText($configFile, ($script:cfg | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    # 以磁盘上的当前内容为底，再覆盖"本次会话真正改过"的键。
+    # 这样挂件运行期间你在 config.json 里手改的值（比如 quitHotkey、followCodex）
+    # 不会在挂件退出时被它内存里的旧值悄悄写回去。
+    $out = [ordered]@{}
+    if (Test-Path -LiteralPath $configFile) {
+      try {
+        $disk = Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($p in $disk.PSObject.Properties) { $out[$p.Name] = $p.Value }
+      } catch { }
+    }
+    foreach ($k in $script:cfg.Keys) {
+      $changedHere = (-not $script:cfgAtStart.ContainsKey($k)) -or
+                     ([string]$script:cfg[$k] -ne [string]$script:cfgAtStart[$k])
+      if ($changedHere -or -not $out.Contains($k)) { $out[$k] = $script:cfg[$k] }
+    }
+    [System.IO.File]::WriteAllText($configFile, ($out | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
   } catch { }
 }
 
 $script:cfg = Read-Config
+$script:cfgAtStart = @{}
+foreach ($k in $script:cfg.Keys) { $script:cfgAtStart[$k] = $script:cfg[$k] }
+
+# 退出快捷键：命令行显式传了就用命令行的，否则用 config.json 里的 quitHotkey
+$script:quitHotkey = if ($PSBoundParameters.ContainsKey('QuitHotkey')) { $QuitHotkey } else { [string]$script:cfg.quitHotkey }
 
 # ---------------------------------------------------------------------------
 # 凭据（沿用 Codex 的 DeepSeek provider）
@@ -646,10 +693,54 @@ public class WhaleForm : Form
     [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
     [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr hdc, IntPtr hObj);
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr hObj);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
     private const int ULW_ALPHA = 0x02;
     private const byte AC_SRC_OVER = 0x00;
     private const byte AC_SRC_ALPHA = 0x01;
+
+    // 退出快捷键 Ctrl+Shift+Z
+    private const int WM_HOTKEY = 0x0312;
+    private const uint MOD_CONTROL = 0x0002;
+    private const uint MOD_SHIFT = 0x0004;
+    private const uint MOD_NOREPEAT = 0x4000;   // 按住不放也只触发一次
+    private const uint VK_Z = 0x5A;
+    private const int QUIT_HOTKEY_ID = 0x5A17;
+
+    private bool _hotkeyOn = false;
+
+    public bool QuitHotkeyRegistered { get { return _hotkeyOn; } }
+    public event EventHandler QuitHotkeyPressed;
+
+    // 注册成全局热键：挂件平时没有焦点，靠窗体 KeyDown 是收不到按键的。
+    // 返回 false 代表这个组合已被别的程序占用，此时挂件照常运行，只是没有快捷键。
+    public bool RegisterQuitHotkey(uint modifiers, uint vk)
+    {
+        if (_hotkeyOn) return true;
+        _hotkeyOn = RegisterHotKey(Handle, QUIT_HOTKEY_ID,
+            modifiers | MOD_NOREPEAT, vk);
+        return _hotkeyOn;
+    }
+
+    public void UnregisterQuitHotkey()
+    {
+        if (!_hotkeyOn) return;
+        UnregisterHotKey(Handle, QUIT_HOTKEY_ID);
+        _hotkeyOn = false;
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == QUIT_HOTKEY_ID)
+        {
+            EventHandler handler = QuitHotkeyPressed;
+            if (handler != null) handler(this, EventArgs.Empty);
+        }
+        base.WndProc(ref m);
+    }
 
     public WhaleForm()
     {
@@ -1547,6 +1638,36 @@ $stopTimer.add_Tick({
 })
 $stopTimer.Start()
 
+# 跟随 Codex：只有带 -FollowCodex 启动（也就是由 Codex 的 MCP 服务拉起来）时才生效。
+# Codex 一退出就自己收起，所以不需要注册任何开机自启 —— 开机时 Codex 没开，
+# 这个挂件也就不会出现；等 Codex 真的打开时，它的 MCP 服务会负责把挂件放出来。
+$CODEX_POLL_MS = 4000
+$CODEX_MISS_LIMIT = 3      # 连续 3 次（约 12 秒）都找不到 Codex 才收，避免误判
+$script:codexMiss = 0
+
+function Test-CodexRunning {
+  $procs = Get-Process -Name $CodexProcessName -ErrorAction SilentlyContinue
+  if (-not $procs) { return $false }
+  foreach ($p in $procs) {
+    try { if ($p.Path -like $CodexPathFilter) { return $true } } catch { }
+  }
+  return $false
+}
+
+$codexTimer = New-Object System.Windows.Forms.Timer
+$codexTimer.Interval = $CODEX_POLL_MS
+$codexTimer.add_Tick({
+  if ($script:closing) { return }
+  if (Test-CodexRunning) { $script:codexMiss = 0; return }
+  $script:codexMiss++
+  if ($script:codexMiss -ge $CODEX_MISS_LIMIT) {
+    Write-Log "连续 $($script:codexMiss) 次检测不到 Codex，自动收起挂件"
+    $script:closing = $true
+    $form.Close()
+  }
+})
+if ($FollowCodex) { $codexTimer.Start() }
+
 # ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
@@ -1579,11 +1700,34 @@ $form.Add_Shown({
   $turnTimer.Start()
   # 每轮消耗的首次对齐（轮询本身已经很便宜，不必再阻塞 UI 等待）
   try { Poll-TurnCost } catch { }
+  # 退出快捷键放在 Shown 里注册：这时窗口句柄一定已经建好
+  $hkText = $script:quitHotkey
+  $hk = Parse-QuitHotkey $hkText
+  if (-not $hkText) {
+    Write-Log '退出快捷键已禁用（quitHotkey 为空）'
+  } elseif (-not $hk) {
+    Write-Log "退出快捷键写法无法识别：$hkText（支持 Ctrl/Shift/Alt/Win + 一个字母或数字）"
+  } elseif ($form.RegisterQuitHotkey([uint32]$hk.Mods, [uint32]$hk.Vk)) {
+    Write-Log "已注册退出快捷键 $hkText"
+  } else {
+    Write-Log "注册退出快捷键 $hkText 失败（可能已被其它程序占用），挂件继续运行"
+  }
+})
+
+# Ctrl+Shift+Z：走的就是"停止信号"那条关闭流程（置 closing 后 form.Close()，
+# 由 FormClosing 保存位置、清理 pid），不另外造一套退出逻辑。
+$form.add_QuitHotkeyPressed({
+  param($sender, $e)
+  if ($script:closing) { return }        # 已经在退出了，避免重复执行
+  Write-Log '收到 Ctrl+Shift+Z，退出挂件'
+  $script:closing = $true
+  $form.Close()
 })
 
 $form.Add_FormClosing({
   param($sender, $e)
-  try { $mainTimer.Stop(); $turnTimer.Stop(); $animTimer.Stop(); $gifTimer.Stop(); $stopTimer.Stop() } catch { }
+  try { $mainTimer.Stop(); $turnTimer.Stop(); $animTimer.Stop(); $gifTimer.Stop(); $stopTimer.Stop(); $codexTimer.Stop() } catch { }
+  try { $form.UnregisterQuitHotkey() } catch { }
   $script:cfg.x = $form.Left; $script:cfg.y = $form.Top
   Save-Config
   foreach ($p in $script:players.Values) { try { $p.Close() } catch { } }

@@ -138,6 +138,8 @@ export const DEFAULT_CONFIG = {
   bubbleOn: true,
   turnCostOn: true,
   turnCostCloseSec: 5,
+  followCodex: true,
+  quitHotkey: "Ctrl+Shift+Z",
   x: null,
   y: null,
 };

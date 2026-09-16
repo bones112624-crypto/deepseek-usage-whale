@@ -23,6 +23,7 @@ description: DeepSeek 余额小鲸鱼挂件。当用户想看 DeepSeek 余额、
 - **随机台词气泡**：点击鲸鱼弹出 → 再点切随机台词 → 再点关闭；总时长 5 秒自动收起
 - **音效**：按压/松手，可选「小黄鸭」(Ya1/Ya2) 或「音效1」(D1/D2)
 - **汉堡菜单**：大小 0.6–2.5、音效、音量、用量模式、气泡开关、每轮消耗开关与自动关闭秒数
+- **退出快捷键**：`Ctrl+Shift+Z` 全局热键，按下即退出挂件（不关 Codex）。组合可在 `~/.deepseek-whale/config.json` 的 `quitHotkey` 里改，留空则禁用。注意 `Ctrl+Shift+Z` 在部分编辑器里是「重做」，会与它冲突
 
 60 秒自动刷新余额；瞬时网络失败沿用最近值不闪错误。
 
@@ -54,22 +55,19 @@ node $CLI balance        # 余额
 node $CLI today          # 今日已用
 node $CLI last-turn      # 上一轮消耗
 node $CLI start          # 放出挂件
+node $CLI stop           # 收起挂件（优雅关闭，会保存位置）
 node $CLI status         # 状态
 ```
 
-## 随 Codex 启停
+## 跟着 Codex 启停
 
-挂件默认由 `widget/whale-follow.ps1` 守护：Codex（桌面版 `ChatGPT.exe`，路径含 `OpenAI.Codex_`）
-一起来就放出小鲸鱼，Codex 一退出就把它优雅收掉。收起走停止信号，位置与配置都会被保存。
+**开机不出现，打开 Codex 会自动出现**，靠插件自己的 MCP 服务触发，不注册任何开机自启：
+Codex 每个会话会拉起 `whale.mjs mcp`，服务启动时顺手放出挂件（并带 `-FollowCodex`）；
+挂件随后每 4 秒检查一次 Codex 进程（`ChatGPT.exe` 且路径含 `OpenAI.Codex_`），
+连续 3 次找不到就优雅收起。
 
-```powershell
-$FOLLOW = "$env:USERPROFILE\plugins\deepseek-whale-widget\widget\whale-follow.ps1"
-powershell -File $FOLLOW -Action status   # 守护状态
-powershell -File $FOLLOW -Action stop     # 收起（下次启动 Codex 自动恢复）
-powershell -File $FOLLOW -Action start    # 独立模式：不依赖 Codex
-```
-
-桌面「DeepSeek 小鲸鱼挂件」快捷方式走的就是 `-Action start`（独立模式，不会被 Codex 退出牵走）。
+关掉这个行为：把 `~/.deepseek-whale/config.json` 的 `followCodex` 设为 `false`。
+手动放出（独立启动，不会被自动收掉）：`node $CLI start`；收起：`node $CLI stop`。
 
 ## 硬性要求
 

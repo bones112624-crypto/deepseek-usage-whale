@@ -22,18 +22,23 @@
 - **左键**：拖拽移动，松手吸附到最近的边或角；单击弹出气泡，再点切换随机台词
 - **右键**：直接打开 DeepSeek 用量监控面板。只启动面板服务本身，不会顺带拉起悬浮球
 - **汉堡菜单**：大小、音效、音量、用量模式、气泡开关、每轮消耗开关
+- **退出快捷键**：`Ctrl+Shift+Z` 直接退出挂件，只关挂件、不影响 Codex
 
 按压有 Q 弹反馈，余额变化时数字滚动；吸附到左边时整体水平镜像，文字反向镜像回来保持可读。
 
-## 随 Codex 启停
+> `Ctrl+Shift+Z` 在不少编辑器里是「重做」，而全局热键是独占的：挂件运行期间这个组合会先被挂件取走。
+> 想换成别的，改 `~/.deepseek-whale/config.json` 里的 `"quitHotkey"`（例如 `"Ctrl+Alt+Q"`），填 `""` 则禁用。
 
-`widget/whale-follow.ps1` 是生命周期守护：Codex 启动就放出挂件，Codex 退出就把它收掉。注册登录自启的计划任务即可：
+## 跟着 Codex 启停
 
-```powershell
-powershell -ExecutionPolicy Bypass -File setup-deepseek-whale-follow.ps1
-```
+**开机不会出现，开着 Codex 就会自动出现**，而且不注册任何开机自启（没有计划任务、没有启动项）。
 
-不想跟随 Codex 时也可以用桌面快捷方式单独启动（独立模式）。
+做法是借用插件自己的 MCP 服务当触发点：Codex 每个会话都会拉起 `whale.mjs mcp`，
+「服务被启动」就等于「Codex 打开了」，它会顺手把挂件放出来。挂件随后每 4 秒检查一次 Codex 进程
+（`ChatGPT.exe` 且路径含 `OpenAI.Codex_`），连续 3 次（约 12 秒）找不到就优雅收起自己，位置和设置都会保存。
+
+不想跟随：把 `~/.deepseek-whale/config.json` 里的 `followCodex` 改成 `false`。
+用桌面快捷方式或 `whale.mjs start` 手动放出时不跟随，也不会被自动收掉。
 
 ## 安装与使用
 
@@ -45,6 +50,7 @@ node $CLI balance     # 余额
 node $CLI today       # 今日已用
 node $CLI last-turn   # 上一轮对话消耗
 node $CLI start       # 放出挂件
+node $CLI stop        # 收起挂件（优雅关闭，会保存位置）
 node $CLI status      # 运行状态
 ```
 
