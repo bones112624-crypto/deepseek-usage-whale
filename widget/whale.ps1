@@ -449,63 +449,103 @@ $script:lastTurnSeen = $false
 $script:costBubble = $false
 $script:costAmount = 0
 $script:costShownAt = $null
+$script:costRate = $null         # "上一轮对话消耗"那颗气泡自己的命中率（那一轮跑完的完整值）
 $script:cacheRate = $null        # 最近一轮的缓存命中率（百分数），气泡第四行用
+$script:loggedTurn = $null       # 已经记过日志的轮次，避免重复刷日志
 
 # 轮询缓存：整目录递归扫描 + 读 768KB 尾部 + 逐行 JSON，一次要几十毫秒。
 # 记下上次用的文件，8 秒内直接复用（仍会 stat 一次确认没被删）；
 # 文件长度没变过就连读都不读。空闲时轮询成本降到接近 0。
-$script:turnFile = $null
+$script:turnFiles = $null
 $script:turnScanAt = [datetime]::MinValue
 $script:turnStamp = $null
 $script:turnCache = $null
 
-function Resolve-RolloutFile {
-  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-  $root = Join-Path $codexHome 'sessions'
-  if (-not (Test-Path -LiteralPath $root)) { return $null }
-  $now = Get-Date
-  if ($script:turnFile -and (($now - $script:turnScanAt).TotalSeconds -lt 8)) {
-    $cached = Get-Item -LiteralPath $script:turnFile -ErrorAction SilentlyContinue
-    if ($cached) { return $cached }
-  }
-  $file = Get-ChildItem -LiteralPath $root -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  $script:turnScanAt = $now
-  $script:turnFile = if ($file) { $file.FullName } else { $null }
-  return $file
-}
-
-function Get-LastTurn {
-  $file = Resolve-RolloutFile
-  if (-not $file) { return $null }
-  $stamp = "$($file.FullName)|$($file.Length)"
-  if ($script:turnStamp -eq $stamp) { return $script:turnCache }   # 内容没变，直接复用
-  $script:turnStamp = $stamp
-  $script:turnCache = $null
-
-  # 只读尾部：一轮对话的记录总在文件末尾，避免全量解析大文件
-  $tailBytes = 768KB
-  $len = 0; $text = ''
+function Read-RolloutTail {
+  param([string]$Path, [int]$Bytes = 786432)
   try {
-    $fs = [System.IO.File]::Open($file.FullName, 'Open', 'Read', 'ReadWrite')
+    $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
     try {
       $len = $fs.Length
-      $read = [Math]::Min($tailBytes, $len)
+      $read = [Math]::Min($Bytes, $len)
       $fs.Seek($len - $read, 'Begin') | Out-Null
       $buf = New-Object byte[] $read
       $null = $fs.Read($buf, 0, $read)
     } finally { $fs.Close() }
-    $text = [System.Text.Encoding]::UTF8.GetString($buf)
+    return [pscustomobject]@{ Text = [System.Text.Encoding]::UTF8.GetString($buf); Length = $len; Read = $read }
   } catch { return $null }
+}
+
+# 倒着找最后一条 token_usage_record，只解析那一行（用来判断"哪个文件里有最新的一轮"）
+function Get-LastUsageEvent {
+  param([string]$Text)
+  $lines = $Text -split "`n"
+  for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    if (-not $lines[$i].Contains('"token_usage_record"')) { continue }
+    try { return ($lines[$i].Trim() | ConvertFrom-Json) } catch { continue }
+  }
+  return $null
+}
+
+function Get-RecentRolloutFiles {
+  param([int]$Count = 3)
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+  $root = Join-Path $codexHome 'sessions'
+  if (-not (Test-Path -LiteralPath $root)) { return @() }
+  $now = Get-Date
+  if ($script:turnFiles -and (($now - $script:turnScanAt).TotalSeconds -lt 8)) { return $script:turnFiles }
+  $files = @(Get-ChildItem -LiteralPath $root -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First $Count)
+  $script:turnScanAt = $now
+  $script:turnFiles = $files
+  return $files
+}
+
+# 决定"最近一轮"取自哪个会话文件。
+# Codex 可以同时开多个会话，各自往自己的 rollout 文件里写；只看"哪个文件最新"会选中
+# 别的会话（典型情况：后台还跑着一个 Agent 会话在持续写），于是气泡里显示的根本不是
+# 你刚说的那句话。这里改成比较各文件最后一条 usage 记录的时间戳，取真正最新的那一轮。
+function Resolve-TurnSource {
+  $best = $null
+  foreach ($f in (Get-RecentRolloutFiles -Count 3)) {
+    $tail = Read-RolloutTail -Path $f.FullName -Bytes 131072
+    if (-not $tail) { continue }
+    $ev = Get-LastUsageEvent $tail.Text
+    if (-not $ev) { continue }
+    $ts = [string]$ev.timestamp
+    if (-not $best -or $ts -gt $best.Ts) {
+      $best = [pscustomobject]@{ File = $f.FullName; Ts = $ts; Turn = [string]$ev.payload.turn_id }
+    }
+  }
+  return $best
+}
+
+function Get-LastTurn {
+  $src = Resolve-TurnSource
+  if (-not $src) { return $null }
+  $stamp = "$($src.File)|$($src.Turn)"
+  if ($script:turnStamp -eq $stamp) { return $script:turnCache }   # 还是同一轮，直接复用
+  $script:turnStamp = $stamp
+  $script:turnCache = $null
+
+  # 只读尾部：一轮对话的记录总在文件末尾，避免全量解析大文件
+  $tailBytes = 786432
+  $tail = Read-RolloutTail -Path $src.File -Bytes $tailBytes
+  if (-not $tail) { return $null }
+  $len = $tail.Length
+  $text = $tail.Text
   if (-not $text) { return $null }
 
   $lines = $text -split "`n"
   if ($lines.Count -gt 1 -and $len -gt $tailBytes) { $lines[0] = '' }  # 首行可能是半截
 
-  $turnId = $null
+  $turnId = $src.Turn
   $records = @()
+  $prevTurnId = $null
+  $prevRecords = @()
   $model = $null
-  # 从尾部倒着扫，只为最后一轮解析少量行
+  # 从尾部倒着扫：先收集最后一轮，越过边界后再收集上一轮（用于"上一轮对话消耗"）。
+  # 上一轮只有在下一轮开始后才算跑完，那时收集到的才是它的完整合计。
   for ($i = $lines.Count - 1; $i -ge 0; $i--) {
     $line = $lines[$i].Trim()
     if (-not $line) { continue }
@@ -519,19 +559,21 @@ function Get-LastTurn {
       if (-not $model -and $ev.payload.model) { $model = [string]$ev.payload.model }
       continue
     }
-    if (-not $turnId) { $turnId = [string]$ev.payload.turn_id }
-    elseif ([string]$ev.payload.turn_id -ne $turnId) { break }   # 已经是上一轮了
+    $tid = [string]$ev.payload.turn_id
+    if (-not $prevTurnId -and $tid -ne $turnId) { $prevTurnId = $tid }   # 进入上一轮
+    if ($prevTurnId -and $tid -ne $prevTurnId) { break }                 # 再往前是更早的轮次
     $u = $ev.payload.usage
     $input = [double]$u.input_tokens
     $cached = [double]$u.cached_input_tokens
     $out = [double]$u.output_tokens
     if (($input + $out) -le 0) { continue }
-    $records += [pscustomobject]@{
+    $rec = [pscustomobject]@{
       ts = [string]$ev.timestamp
       hit = $cached
       miss = [Math]::Max(0, $input - $cached)
       out = $out + [double]$u.reasoning_output_tokens
     }
+    if ($prevTurnId) { $prevRecords += $rec } else { $records += $rec }
   }
   if (-not $turnId -or $records.Count -eq 0) { return $null }
 
@@ -540,7 +582,27 @@ function Get-LastTurn {
   $when = Get-Date
   try { $when = [datetime]::Parse($ts).ToLocalTime() } catch { }
   $amount = Get-Cost -Model $model -Hit $hit -Miss $miss -Out $out2 -When $when
-  $script:turnCache = [pscustomobject]@{ turn = $turnId; amount = $amount; model = $model; hit = $hit; miss = $miss; out = $out2; ts = $ts }
+
+  # 上一轮的完整合计（如果有）
+  $prevAgg = $null
+  if ($prevRecords.Count -gt 0) {
+    $ph = 0.0; $pm = 0.0; $po = 0.0; $pts = $prevRecords[$prevRecords.Count - 1].ts
+    foreach ($r in $prevRecords) { $ph += $r.hit; $pm += $r.miss; $po += $r.out }
+    $pwhen = Get-Date
+    try { $pwhen = [datetime]::Parse($pts).ToLocalTime() } catch { }
+    $prevAgg = [pscustomobject]@{
+      turn = $prevTurnId
+      amount = Get-Cost -Model $model -Hit $ph -Miss $pm -Out $po -When $pwhen
+      model = $model
+      hit = $ph; miss = $pm; out = $po; ts = $pts
+    }
+  }
+
+  $script:turnCache = [pscustomobject]@{
+    turn = $turnId; amount = $amount; model = $model
+    hit = $hit; miss = $miss; out = $out2; ts = $ts
+    prev = $prevAgg
+  }
   return $script:turnCache
 }
 
@@ -551,6 +613,14 @@ function Update-TurnStats {
   if (-not $turn) { return $null }
   $inTok = [double]$turn.hit + [double]$turn.miss
   $script:cacheRate = if ($inTok -gt 0) { 100.0 * [double]$turn.hit / $inTok } else { $null }
+  # 每换一轮记一条，方便事后核对气泡里那个百分比是怎么算出来的
+  $tid = [string]$turn.turn
+  if ($tid -and $tid -ne $script:loggedTurn) {
+    $script:loggedTurn = $tid
+    Write-Log ("轮到 " + $tid.Substring(0, [Math]::Min(8, $tid.Length)) +
+               "：命中 " + [Math]::Round($script:cacheRate, 2) + "%（cached=" + [long]$turn.hit +
+               " miss=" + [long]$turn.miss + "）")
+  }
   return $turn
 }
 
@@ -568,14 +638,19 @@ function Poll-TurnCost {
     $script:lastTurnSeq = if ($prev) { [int]$prev.seq } else { 0 }
     return
   }
-  if ($prev -and [string]$prev.turn -eq $turn.turn) { return }   # 同一轮，不重复弹
+  # 弹"上一轮对话消耗"要的是那一轮跑完之后的完整合计，而不是它刚开头那一次请求：
+  # 一轮里往往还有几十次工具调用，只取第一条会把消耗和缓存命中率都算小。
+  # 新的一轮开始了 ⇒ 上一轮已经结束，这时 $turn.prev 才是它的完整数据。
+  $show = $turn.prev
+  if (-not $show) { return }                                     # 还没有可报的上一轮
+  if ($prev -and [string]$prev.turn -eq [string]$show.turn) { return }   # 这一轮已经报过
 
   $seq = $script:lastTurnSeq + 1
   $script:lastTurnSeq = $seq
   $payload = [pscustomobject]@{
-    ok = $true; seq = $seq; turn = $turn.turn
-    amount = [Math]::Round($turn.amount, 6); model = $turn.model
-    hit = $turn.hit; miss = $turn.miss; out = $turn.out; ts = $turn.ts
+    ok = $true; seq = $seq; turn = $show.turn
+    amount = [Math]::Round($show.amount, 6); model = $show.model
+    hit = $show.hit; miss = $show.miss; out = $show.out; ts = $show.ts
   }
   try {
     [System.IO.File]::WriteAllText($costFile, ($payload | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
@@ -583,7 +658,8 @@ function Poll-TurnCost {
 
   if ($script:cfg.turnCostOn) {
     $script:costBubble = $true
-    $script:costAmount = $turn.amount
+    $script:costAmount = $show.amount
+    $script:costRate = if (($show.hit + $show.miss) -gt 0) { 100.0 * [double]$show.hit / ([double]$show.hit + [double]$show.miss) } else { $null }
     $script:costShownAt = Get-Date
   }
 }
@@ -622,8 +698,14 @@ function Get-RandomLines {
 # 缓存命中率文案。命中率 = 命中输入 token /（命中 + 未命中）输入 token，
 # 取自最近一轮对话的真实 usage；还没读到会话记录时显示破折号。
 function Get-CacheText {
-  if ($null -eq $script:cacheRate) { return '上轮命中 —' }
-  return ('上轮命中 {0:N0}%' -f [double]$script:cacheRate)
+  param([switch]$ForCost)
+  $raw = if ($ForCost) { $script:costRate } else { $script:cacheRate }
+  if ($null -eq $raw) { return '上轮命中 —' }
+  $r = [double]$raw
+  # 长会话的缓存命中率天然会贴着 100%（整段上下文几乎都在前缀缓存里），
+  # 四舍五入成 "100%" 会让人以为这个数字没在统计，所以 99% 以上保留一位小数。
+  if ($r -ge 99) { return ('上轮命中 {0:N1}%' -f $r) }
+  return ('上轮命中 {0:N0}%' -f $r)
 }
 
 function Get-NormalLines {
@@ -641,7 +723,7 @@ function Get-NormalLines {
     @{ t = 'DeepSeek 余额'; s = 'A'; c = '' }
     @{ t = $amt; s = 'B'; c = '' }
     @{ t = $hint; s = 'C'; c = '' }
-    @{ t = (Get-CacheText); s = 'C'; c = '' }
+    @{ t = (Get-CacheText); s = 'D'; c = '' }
   )
 }
 
@@ -906,7 +988,7 @@ function Get-TextLines {
     return @(
       @{ t = '上一轮对话消耗:'; s = 'A'; c = '' }
       @{ t = (Format-Money $script:costAmount $script:currency); s = 'B'; c = $C_PEAK }
-      @{ t = (Get-CacheText); s = 'C'; c = '' }
+      @{ t = (Get-CacheText -ForCost); s = 'D'; c = '' }
     )
   }
   if ($script:bubbleRandom) {
@@ -934,9 +1016,9 @@ function New-BubblePath {
 
 function New-LineFont {
   param([string]$Style, [double]$U)
-  $size = switch ($Style) { 'B' { 128 } 'P' { 104 } 'A' { 66 } default { 56 } }
+  $size = switch ($Style) { 'B' { 128 } 'P' { 104 } 'A' { 66 } 'D' { 48 } default { 56 } }
   $px = [float]([Math]::Max(7.0, $size * $U))
-  $style2 = if ($Style -eq 'C') { [System.Drawing.FontStyle]::Regular } else { [System.Drawing.FontStyle]::Bold }
+  $style2 = if ($Style -eq 'C' -or $Style -eq 'D') { [System.Drawing.FontStyle]::Regular } else { [System.Drawing.FontStyle]::Bold }
   return New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', $px, $style2, ([System.Drawing.GraphicsUnit]::Pixel)
 }
 
@@ -1104,6 +1186,7 @@ function New-Surface {
           'B' { 128 * $u * 1.05 }
           'P' { 104 * $u * 1.05 }
           'A' { 66 * $u * 1.15 }
+          'D' { 48 * $u * 1.15 + 9 * $u }
           default { 56 * $u * 1.15 + 9 * $u }
         }
         if ($ln.wrap) { $lineH = [double]$sz.Height }
@@ -1756,7 +1839,7 @@ if ($RenderOnly) {
   $script:shown = 1288.5
   $script:todayUsage = 12.34
   $script:status = 'ok'
-  $script:cacheRate = 82.4
+  $script:cacheRate = 99.904
   if ($RenderBubble) { $script:bubbleOpen = $true }
   if ($RenderFlip) { $script:flip = -1; $script:flipAnim = -1.0; $script:flipTarget = -1.0 }
   $bmp = $null
