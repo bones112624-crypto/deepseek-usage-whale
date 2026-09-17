@@ -4,9 +4,13 @@
 
 .DESCRIPTION
   把 DSH 版「DeepSeek-Balance-Whale-Widget」的外观与交互搬到 Windows 桌面：
-  小鲸鱼 cut-out 立绘 + 代码绘制的对话气泡 + 余额/今日已用/上轮缓存命中率，
+  小鲸鱼 cut-out 立绘 + 代码绘制的对话气泡 + 余额/今日已用/本轮缓存命中率，
   支持拖拽、四边四分之一吸附、左吸附镜像翻转、按压 Q 弹、数字滚动、
-  随机台词气泡、汉堡菜单（大小/音效/音量/用量模式/气泡开关）与音效。
+  随机台词气泡与音效（音效开关、大小、用量模式等改由配置文件与 CLI 设置）。
+
+  生命周期：跟着 Codex 启停 —— Codex 打开（其 MCP 服务被拉起）时自动放出，
+  Codex 退出后自动收起；手动独立启动（Codex 未运行时）则不会被自动收掉。
+  退出快捷键 Ctrl+Shift+Z 只关挂件，不影响 Codex。
 
   鼠标：左键拖拽或点击出气泡，右键直接打开 DeepSeek 用量监控面板
   （只启动面板服务本身，不会顺带拉起悬浮球；node 的控制台窗口是隐藏的）。
@@ -25,7 +29,6 @@ param(
   [switch]$RenderBubble,    # 调试用：渲染时把气泡打开
   [switch]$RenderFlip,      # 调试用：渲染左吸附镜像态
   [switch]$TestOpenPanel,   # 调试用：只跑一次"右键打开面板"的服务启动逻辑后退出
-  [switch]$FollowCodex,     # 由 Codex 的 MCP 服务拉起时带上：Codex 退出后自动收起
   [string]$CodexProcessName = 'ChatGPT',        # 跟随模式下用来识别 Codex 的进程名
   [string]$CodexPathFilter = '*OpenAI.Codex_*', # 再按路径筛一次，避免认错同名进程
   [string]$QuitHotkey,                          # 退出快捷键；不传就用 config.json 里的 quitHotkey
@@ -56,7 +59,6 @@ $WIDGET_H = 700
 $WHALE_RATIO = 0.5945  # 立绘占挂件宽度比例
 $TEXT_X = 0.4425       # 文字块中心
 $TEXT_Y = 0.38
-$MENU_BTN_TOP = 0.4055
 
 if (-not $AssetDir) {
   $AssetDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets'
@@ -72,6 +74,7 @@ $logFile = Join-Path $DataDir 'whale.log'
 # 跟随脚本用它来"优雅关闭"：写这个文件 → 挂件自己走完关闭流程后退出
 $stopFile = Join-Path $DataDir 'whale-stop'
 $pidFile = Join-Path $DataDir 'widget.pid'
+$userStopFile = Join-Path $DataDir 'user-stop.json'   # 用户主动 Ctrl+Shift+Z 关掉的记号
 
 function Write-Log {
   param([string]$Message)
@@ -451,6 +454,7 @@ $script:costAmount = 0
 $script:costShownAt = $null
 $script:costRate = $null         # "上一轮对话消耗"那颗气泡自己的命中率（那一轮跑完的完整值）
 $script:cacheRate = $null        # 最近一轮的缓存命中率（百分数），气泡第四行用
+$script:threadRate = $null       # 整个会话累计的缓存命中率（百分数），悬停详情里显示
 $script:loggedTurn = $null       # 已经记过日志的轮次，避免重复刷日志
 
 # 轮询缓存：整目录递归扫描 + 读 768KB 尾部 + 逐行 JSON，一次要几十毫秒。
@@ -460,6 +464,8 @@ $script:turnFiles = $null
 $script:turnScanAt = [datetime]::MinValue
 $script:turnStamp = $null
 $script:turnCache = $null
+$script:activeThreads = @()
+$script:activeScanAt = [datetime]::MinValue
 
 function Read-RolloutTail {
   param([string]$Path, [int]$Bytes = 786432)
@@ -476,6 +482,47 @@ function Read-RolloutTail {
   } catch { return $null }
 }
 
+# 读属性；字段不存在返回 $null —— 这样才能把"字段缺失"和"值为 0"区分开
+function Get-JsonProp {
+  param($Obj, [string]$Name)
+  if ($null -eq $Obj) { return $null }
+  $p = $Obj.PSObject.Properties[$Name]
+  if ($null -eq $p) { return $null }
+  return $p.Value
+}
+
+# 把一段 usage（单次请求）或聚合（turn_token_usage / thread_token_usage）规范化成
+# 「命中 / 未命中 / 输出」三个数。
+#   · input_tokens 缺失、cached_input_tokens 缺失、input <= 0 → 返回 $null（显示 "—"），
+#     绝不把缺失当成 0%，否则会错显成 0% 命中率
+#   · cached 做安全截断：负值归 0，超过 input 时按 input 计，保证命中率不超过 100%
+function Convert-TokenAgg {
+  param($Usage)
+  if ($null -eq $Usage) { return $null }
+  $inRaw = Get-JsonProp $Usage 'input_tokens'
+  $cRaw = Get-JsonProp $Usage 'cached_input_tokens'
+  if ($null -eq $inRaw -or $null -eq $cRaw) { return $null }
+  $input = [double]$inRaw
+  $cached = [double]$cRaw
+  if ($input -le 0) { return $null }
+  if ($cached -lt 0) { $cached = 0 }
+  if ($cached -gt $input) { $cached = $input }
+  $out = 0.0
+  $reason = 0.0
+  $oRaw = Get-JsonProp $Usage 'output_tokens'
+  if ($null -ne $oRaw) { $out = [double]$oRaw }
+  $rRaw = Get-JsonProp $Usage 'reasoning_output_tokens'
+  if ($null -ne $rRaw) { $reason = [double]$rRaw }
+  return [pscustomobject]@{
+    input  = $input
+    cached = $cached
+    miss   = $input - $cached
+    out    = $out
+    reason = $reason
+    rate   = 100.0 * $cached / $input
+  }
+}
+
 # 倒着找最后一条 token_usage_record，只解析那一行（用来判断"哪个文件里有最新的一轮"）
 function Get-LastUsageEvent {
   param([string]$Text)
@@ -487,8 +534,28 @@ function Get-LastUsageEvent {
   return $null
 }
 
+# Codex 正在写哪个会话？~/.codex/thread-writer-locks/<threadId>.lock 只在该会话
+# 被写入期间存在（正在跑一轮），这是"当前正在使用的会话"的可靠信号，比"全局最新
+# 时间戳"准。锁目录读不到时返回空数组，调用方会退回旧规则。
+function Get-ActiveThreadIds {
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+  $lockDir = Join-Path $codexHome 'thread-writer-locks'
+  $now = Get-Date
+  if ((($now - $script:activeScanAt).TotalSeconds -lt 2)) { return $script:activeThreads }
+  $ids = @()
+  try {
+    foreach ($f in (Get-ChildItem -LiteralPath $lockDir -Filter '*.lock' -File -ErrorAction SilentlyContinue)) {
+      $name = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+      if ($name -and -not $name.StartsWith('.')) { $ids += $name }
+    }
+  } catch { }
+  $script:activeThreads = $ids
+  $script:activeScanAt = $now
+  return $ids
+}
+
 function Get-RecentRolloutFiles {
-  param([int]$Count = 3)
+  param([int]$Count = 6)
   $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
   $root = Join-Path $codexHome 'sessions'
   if (-not (Test-Path -LiteralPath $root)) { return @() }
@@ -502,29 +569,48 @@ function Get-RecentRolloutFiles {
 }
 
 # 决定"最近一轮"取自哪个会话文件。
-# Codex 可以同时开多个会话，各自往自己的 rollout 文件里写；只看"哪个文件最新"会选中
-# 别的会话（典型情况：后台还跑着一个 Agent 会话在持续写），于是气泡里显示的根本不是
-# 你刚说的那句话。这里改成比较各文件最后一条 usage 记录的时间戳，取真正最新的那一轮。
+# 第一优先：Codex 正在写的那个会话（thread-writer-locks 里有锁的 thread id）。
+# 拿不到锁（例如刚打开还没发消息、或锁目录不可读）时，退回"各文件最后一条 usage
+# 记录的时间戳最新者"。这两条规则都是 Codex 自己写下来的事实，不做额外猜测。
 function Resolve-TurnSource {
+  $active = @(Get-ActiveThreadIds)
   $best = $null
-  foreach ($f in (Get-RecentRolloutFiles -Count 3)) {
+  $bestActive = $null
+  foreach ($f in (Get-RecentRolloutFiles -Count 6)) {
     $tail = Read-RolloutTail -Path $f.FullName -Bytes 131072
     if (-not $tail) { continue }
     $ev = Get-LastUsageEvent $tail.Text
     if (-not $ev) { continue }
-    $ts = [string]$ev.timestamp
-    if (-not $best -or $ts -gt $best.Ts) {
-      $best = [pscustomobject]@{ File = $f.FullName; Ts = $ts; Turn = [string]$ev.payload.turn_id }
+    $threadId = [string](Get-JsonProp $ev.payload 'thread_id')
+    if (-not $threadId) {
+      # 文件名里也带 thread id：rollout-<时间>-<threadId>[_<fork>].jsonl
+      $m = [regex]::Match($f.Name, '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+      if ($m.Success) { $threadId = $m.Groups[1].Value }
     }
+    $cand = [pscustomobject]@{
+      File   = $f.FullName
+      Turn   = [string](Get-JsonProp $ev.payload 'turn_id')
+      Thread = $threadId
+      Ts     = [string]$ev.timestamp
+      Length = $f.Length
+      IsActive = [bool]($threadId -and ($active -contains $threadId))
+    }
+    if ($cand.IsActive -and ((-not $bestActive) -or $cand.Ts -gt $bestActive.Ts)) { $bestActive = $cand }
+    if ((-not $best) -or $cand.Ts -gt $best.Ts) { $best = $cand }
   }
+  if ($bestActive) { return $bestActive }
   return $best
 }
 
 function Get-LastTurn {
   $src = Resolve-TurnSource
   if (-not $src) { return $null }
-  $stamp = "$($src.File)|$($src.Turn)"
-  if ($script:turnStamp -eq $stamp) { return $script:turnCache }   # 还是同一轮，直接复用
+  # 复用键带上"文件当前长度"：同一轮进行中日志一长就重算，不会冻结在第一次看到的值。
+  # 长度必须现取一次：候选文件列表本身是缓存过的，FileInfo.Length 会是旧的。
+  $lenNow = $src.Length
+  try { $lenNow = (Get-Item -LiteralPath $src.File -ErrorAction Stop).Length } catch { }
+  $stamp = "$($src.File)|$lenNow"
+  if ($script:turnStamp -eq $stamp -and $script:turnCache) { return $script:turnCache }
   $script:turnStamp = $stamp
   $script:turnCache = $null
 
@@ -543,9 +629,12 @@ function Get-LastTurn {
   $records = @()
   $prevTurnId = $null
   $prevRecords = @()
+  $turnAggRaw = $null
+  $threadAggRaw = $null
+  $prevAggRaw = $null
   $model = $null
-  # 从尾部倒着扫：先收集最后一轮，越过边界后再收集上一轮（用于"上一轮对话消耗"）。
-  # 上一轮只有在下一轮开始后才算跑完，那时收集到的才是它的完整合计。
+  # 从尾部倒着扫：先取当前轮（最新一条记录的 turn_token_usage 就是本轮累计），
+  # 越过边界后再取上一轮（用于"上一轮对话消耗"）。
   for ($i = $lines.Count - 1; $i -ge 0; $i--) {
     $line = $lines[$i].Trim()
     if (-not $line) { continue }
@@ -553,73 +642,110 @@ function Get-LastTurn {
     $isCtx = $line.Contains('"turn_context"')
     if (-not $isUsage -and -not $isCtx) { continue }
     $ev = $null
-    try { $ev = $line | ConvertFrom-Json } catch { continue }
+    try { $ev = $line | ConvertFrom-Json } catch { continue }   # 半条/坏行直接跳过
 
     if ($isCtx) {
       if (-not $model -and $ev.payload.model) { $model = [string]$ev.payload.model }
       continue
     }
-    $tid = [string]$ev.payload.turn_id
+    $tid = [string](Get-JsonProp $ev.payload 'turn_id')
     if (-not $prevTurnId -and $tid -ne $turnId) { $prevTurnId = $tid }   # 进入上一轮
     if ($prevTurnId -and $tid -ne $prevTurnId) { break }                 # 再往前是更早的轮次
-    $u = $ev.payload.usage
-    $input = [double]$u.input_tokens
-    $cached = [double]$u.cached_input_tokens
-    $out = [double]$u.output_tokens
-    if (($input + $out) -le 0) { continue }
-    $rec = [pscustomobject]@{
-      ts = [string]$ev.timestamp
-      hit = $cached
-      miss = [Math]::Max(0, $input - $cached)
-      out = $out + [double]$u.reasoning_output_tokens
+    if (-not $prevTurnId) {
+      if ($null -eq $turnAggRaw) { $turnAggRaw = Get-JsonProp $ev.payload 'turn_token_usage' }
+      if ($null -eq $threadAggRaw) { $threadAggRaw = Get-JsonProp $ev.payload 'thread_token_usage' }
+    } elseif ($null -eq $prevAggRaw) {
+      $prevAggRaw = Get-JsonProp $ev.payload 'turn_token_usage'
     }
+    $agg = Convert-TokenAgg (Get-JsonProp $ev.payload 'usage')
+    if (-not $agg) { continue }
+    $rec = [pscustomobject]@{ ts = [string]$ev.timestamp; agg = $agg }
     if ($prevTurnId) { $prevRecords += $rec } else { $records += $rec }
   }
   if (-not $turnId -or $records.Count -eq 0) { return $null }
 
-  $hit = 0.0; $miss = 0.0; $out2 = 0.0; $ts = $records[$records.Count - 1].ts
-  foreach ($r in $records) { $hit += $r.hit; $miss += $r.miss; $out2 += $r.out }
+  # 本轮：优先用 Codex 自己算好的 turn_token_usage；拿不到才退回"逐条求和"
+  $srcKind = 'turn_token_usage'
+  $cur = Convert-TokenAgg $turnAggRaw
+  if (-not $cur) {
+    $srcKind = 'sum(usage)'
+    $h = 0.0; $m = 0.0; $o = 0.0
+    foreach ($r in $records) { $h += $r.agg.cached; $m += $r.agg.miss; $o += $r.agg.out + $r.agg.reason }
+    if (($h + $m) -gt 0) {
+      $cur = [pscustomobject]@{ input = $h + $m; cached = $h; miss = $m; out = $o; reason = 0.0; rate = 100.0 * $h / ($h + $m) }
+    }
+  } else {
+    $cur = [pscustomobject]@{ input = $cur.input; cached = $cur.cached; miss = $cur.miss; out = $cur.out; reason = $cur.reason; rate = $cur.rate }
+  }
+
+  $ts = $records[0].ts
   $when = Get-Date
   try { $when = [datetime]::Parse($ts).ToLocalTime() } catch { }
-  $amount = Get-Cost -Model $model -Hit $hit -Miss $miss -Out $out2 -When $when
+  $amount = 0.0
+  if ($cur) { $amount = Get-Cost -Model $model -Hit $cur.cached -Miss $cur.miss -Out ($cur.out + $cur.reason) -When $when }
 
-  # 上一轮的完整合计（如果有）
+  # 上一轮的完整合计（用于"上一轮对话消耗"气泡）
   $prevAgg = $null
-  if ($prevRecords.Count -gt 0) {
-    $ph = 0.0; $pm = 0.0; $po = 0.0; $pts = $prevRecords[$prevRecords.Count - 1].ts
-    foreach ($r in $prevRecords) { $ph += $r.hit; $pm += $r.miss; $po += $r.out }
+  $prevCur = Convert-TokenAgg $prevAggRaw
+  if (-not $prevCur -and $prevRecords.Count -gt 0) {
+    $ph = 0.0; $pm = 0.0; $po = 0.0
+    foreach ($r in $prevRecords) { $ph += $r.agg.cached; $pm += $r.agg.miss; $po += $r.agg.out + $r.agg.reason }
+    if (($ph + $pm) -gt 0) {
+      $prevCur = [pscustomobject]@{ input = $ph + $pm; cached = $ph; miss = $pm; out = $po; reason = 0.0; rate = 100.0 * $ph / ($ph + $pm) }
+    }
+  }
+  if ($prevCur) {
+    $pts = if ($prevRecords.Count -gt 0) { $prevRecords[0].ts } else { $ts }
     $pwhen = Get-Date
     try { $pwhen = [datetime]::Parse($pts).ToLocalTime() } catch { }
     $prevAgg = [pscustomobject]@{
-      turn = $prevTurnId
-      amount = Get-Cost -Model $model -Hit $ph -Miss $pm -Out $po -When $pwhen
-      model = $model
-      hit = $ph; miss = $pm; out = $po; ts = $pts
+      turn   = $prevTurnId
+      amount = Get-Cost -Model $model -Hit $prevCur.cached -Miss $prevCur.miss -Out ($prevCur.out + $prevCur.reason) -When $pwhen
+      model  = $model
+      hit    = $prevCur.cached; miss = $prevCur.miss; out = $prevCur.out + $prevCur.reason
+      rate   = $prevCur.rate
+      ts     = $pts
     }
   }
 
+  $threadCur = Convert-TokenAgg $threadAggRaw
+
   $script:turnCache = [pscustomobject]@{
-    turn = $turnId; amount = $amount; model = $model
-    hit = $hit; miss = $miss; out = $out2; ts = $ts
-    prev = $prevAgg
+    turn      = $turnId
+    thread    = $src.Thread
+    isActive  = $src.IsActive
+    source    = $srcKind
+    model     = $model
+    hit       = if ($cur) { $cur.cached } else { 0.0 }
+    miss      = if ($cur) { $cur.miss } else { 0.0 }
+    out       = if ($cur) { $cur.out + $cur.reason } else { 0.0 }
+    rate      = if ($cur) { $cur.rate } else { $null }
+    threadRate = if ($threadCur) { $threadCur.rate } else { $null }
+    amount    = $amount
+    ts        = $ts
+    prev      = $prevAgg
   }
   return $script:turnCache
 }
 
-# 每轮统计：不论是否弹"每轮消耗"气泡，都刷新最近一轮的缓存命中率，
-# 因为气泡第四行一直要显示它。
+# 每轮统计：不论是否弹"每轮消耗"气泡，都刷新缓存命中率，因为气泡一直要显示它。
+# 命中率缺失时置 $null（显示 "—"），不会退化成 0%。
 function Update-TurnStats {
   $turn = Get-LastTurn
   if (-not $turn) { return $null }
-  $inTok = [double]$turn.hit + [double]$turn.miss
-  $script:cacheRate = if ($inTok -gt 0) { 100.0 * [double]$turn.hit / $inTok } else { $null }
-  # 每换一轮记一条，方便事后核对气泡里那个百分比是怎么算出来的
+  $script:cacheRate = $turn.rate
+  $script:threadRate = $turn.threadRate
+  # 轮次变化、或本轮命中率发生变化时记一条，方便核对"数值确实在跟着刷新"
   $tid = [string]$turn.turn
-  if ($tid -and $tid -ne $script:loggedTurn) {
-    $script:loggedTurn = $tid
-    Write-Log ("轮到 " + $tid.Substring(0, [Math]::Min(8, $tid.Length)) +
-               "：命中 " + [Math]::Round($script:cacheRate, 2) + "%（cached=" + [long]$turn.hit +
-               " miss=" + [long]$turn.miss + "）")
+  $rateTxt = if ($null -eq $turn.rate) { '—' } else { [Math]::Round([double]$turn.rate, 1).ToString() }
+  $threadTxt = if ($null -eq $turn.threadRate) { '—' } else { [Math]::Round([double]$turn.threadRate, 1).ToString() }
+  $sig = "$tid|$rateTxt|$threadTxt|$($turn.source)|$($turn.isActive)"
+  if ($tid -and $sig -ne $script:loggedTurn) {
+    $script:loggedTurn = $sig
+    $scope = if ($turn.isActive) { '当前会话' } else { '回退(无写入锁)' }
+    Write-Log ("轮到 " + $tid.Substring(0, [Math]::Min(8, $tid.Length)) + "：本轮命中 " + $rateTxt +
+               "%（本会话 " + $threadTxt + "%；cached=" + [long]$turn.hit + " miss=" + [long]$turn.miss +
+               "；来源 " + $turn.source + "；" + $scope + "）")
   }
   return $turn
 }
@@ -659,7 +785,8 @@ function Poll-TurnCost {
   if ($script:cfg.turnCostOn) {
     $script:costBubble = $true
     $script:costAmount = $show.amount
-    $script:costRate = if (($show.hit + $show.miss) -gt 0) { 100.0 * [double]$show.hit / ([double]$show.hit + [double]$show.miss) } else { $null }
+    # 直接用那一轮聚合出来的命中率（口径与主显示一致，不再各自算一遍）
+    $script:costRate = $show.rate
     $script:costShownAt = Get-Date
   }
 }
@@ -700,12 +827,17 @@ function Get-RandomLines {
 function Get-CacheText {
   param([switch]$ForCost)
   $raw = if ($ForCost) { $script:costRate } else { $script:cacheRate }
-  if ($null -eq $raw) { return '上轮命中 —' }
+  # 缺数据就显示 "—"，不要退化成 0%：0% 是"一条都没命中"的真实结果，两者不能混
+  if ($null -eq $raw) {
+    if ($ForCost) { return '命中 —' }
+    return '本轮命中 —'
+  }
   $r = [double]$raw
   # 长会话的缓存命中率天然会贴着 100%（整段上下文几乎都在前缀缓存里），
   # 四舍五入成 "100%" 会让人以为这个数字没在统计，所以 99% 以上保留一位小数。
-  if ($r -ge 99) { return ('上轮命中 {0:N1}%' -f $r) }
-  return ('上轮命中 {0:N0}%' -f $r)
+  $txt = if ($r -ge 99) { '{0:N1}%' -f $r } else { '{0:N0}%' -f $r }
+  if ($ForCost) { return ('命中 ' + $txt) }   # 这颗气泡讲的是"上一轮"，不再冠以"本轮"
+  return ('本轮命中 ' + $txt)
 }
 
 function Get-NormalLines {
@@ -1107,6 +1239,7 @@ function Get-ContentLayer {
     $g.FillPath($white, $path)    # 再填充 → 只留下并集外侧的轮廓线
     $white.Dispose(); $pen.Dispose()
   }
+
   $g.Dispose()
 
   if ($script:rc.layer) { $script:rc.layer.Dispose() }
@@ -1353,127 +1486,6 @@ function On-WhaleClick {
   Refresh-Balance -Manual | Out-Null
 }
 
-# ---------------------------------------------------------------------------
-# 汉堡菜单
-# ---------------------------------------------------------------------------
-$menuForm = New-Object System.Windows.Forms.Form
-$menuForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-$menuForm.ShowInTaskbar = $false
-$menuForm.TopMost = $true
-$menuForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-$menuForm.BackColor = [System.Drawing.Color]::FromArgb(252, 252, 255)
-$menuForm.ClientSize = New-Object System.Drawing.Size(268, 214)
-$fontUI = New-Object System.Drawing.Font -ArgumentList 'Microsoft YaHei UI', 9
-$menuForm.Font = $fontUI
-$ink = [System.Drawing.Color]::FromArgb(32, 49, 112)
-
-function New-MenuLabel {
-  param([string]$Text, [int]$X, [int]$Y, [int]$W)
-  $l = New-Object System.Windows.Forms.Label
-  $l.Text = $Text; $l.Location = New-Object System.Drawing.Point($X, $Y)
-  $l.Size = New-Object System.Drawing.Size($W, 20); $l.ForeColor = $ink; $l.TextAlign = 'MiddleLeft'
-  $menuForm.Controls.Add($l); return $l
-}
-
-[void](New-MenuLabel '大小' 12 12 34)
-$scaleBar = New-Object System.Windows.Forms.TrackBar
-$scaleBar.Minimum = 6; $scaleBar.Maximum = 25; $scaleBar.TickStyle = 'None'
-$scaleBar.Location = New-Object System.Drawing.Point(50, 8); $scaleBar.Size = New-Object System.Drawing.Size(140, 28)
-$scaleBar.Value = [int][Math]::Round([double]$script:cfg.scale * 10)
-$scaleBox = New-Object System.Windows.Forms.NumericUpDown
-$scaleBox.Minimum = 1; $scaleBox.Maximum = 20; $scaleBox.Value = 10
-$scaleBox.Location = New-Object System.Drawing.Point(198, 12); $scaleBox.Size = New-Object System.Drawing.Size(56, 24)
-$menuForm.Controls.Add($scaleBar); $menuForm.Controls.Add($scaleBox)
-
-[void](New-MenuLabel '音效' 12 44 34)
-$soundBox = New-Object System.Windows.Forms.ComboBox
-$soundBox.DropDownStyle = 'DropDownList'
-$soundBox.Location = New-Object System.Drawing.Point(50, 42); $soundBox.Size = New-Object System.Drawing.Size(140, 24)
-[void]$soundBox.Items.Add('小黄鸭'); [void]$soundBox.Items.Add('音效1')
-$soundBox.SelectedIndex = if ($script:cfg.soundSet -eq 'fx1') { 1 } else { 0 }
-$soundChk = New-Object System.Windows.Forms.CheckBox
-$soundChk.Text = '开'; $soundChk.Checked = [bool]$script:cfg.sound
-$soundChk.Location = New-Object System.Drawing.Point(198, 43); $soundChk.Size = New-Object System.Drawing.Size(56, 22)
-$menuForm.Controls.Add($soundBox); $menuForm.Controls.Add($soundChk)
-
-[void](New-MenuLabel '音量' 12 76 34)
-$volBar = New-Object System.Windows.Forms.TrackBar
-$volBar.Minimum = 0; $volBar.Maximum = 100; $volBar.TickStyle = 'None'
-$volBar.Location = New-Object System.Drawing.Point(50, 72); $volBar.Size = New-Object System.Drawing.Size(140, 28)
-$volBar.Value = [int][Math]::Round([double]$script:cfg.vol * 100)
-$volPct = New-MenuLabel ("{0}%" -f [int][Math]::Round([double]$script:cfg.vol * 100)) 198 76 56
-$menuForm.Controls.Add($volBar)
-
-[void](New-MenuLabel '用量' 12 108 34)
-$usageBox = New-Object System.Windows.Forms.ComboBox
-$usageBox.DropDownStyle = 'DropDownList'
-$usageBox.Location = New-Object System.Drawing.Point(50, 106); $usageBox.Size = New-Object System.Drawing.Size(204, 24)
-[void]$usageBox.Items.Add('小鲸鱼记账（推荐）'); [void]$usageBox.Items.Add('实时·令牌（需平台令牌）')
-$usageBox.SelectedIndex = if ($script:cfg.usageMode -eq 'token') { 1 } else { 0 }
-$menuForm.Controls.Add($usageBox)
-
-$sep = New-Object System.Windows.Forms.Label
-$sep.BorderStyle = 'Fixed3D'; $sep.Location = New-Object System.Drawing.Point(12, 140)
-$sep.Size = New-Object System.Drawing.Size(244, 2)
-$menuForm.Controls.Add($sep)
-
-$bubbleChk = New-Object System.Windows.Forms.CheckBox
-$bubbleChk.Text = '显示气泡'; $bubbleChk.Checked = [bool]$script:cfg.bubbleOn
-$bubbleChk.Location = New-Object System.Drawing.Point(12, 148); $bubbleChk.Size = New-Object System.Drawing.Size(100, 24)
-$bubbleChk.ForeColor = $ink
-$menuForm.Controls.Add($bubbleChk)
-
-$turnChk = New-Object System.Windows.Forms.CheckBox
-$turnChk.Text = '每轮消耗'; $turnChk.Checked = [bool]$script:cfg.turnCostOn
-$turnChk.Location = New-Object System.Drawing.Point(12, 178); $turnChk.Size = New-Object System.Drawing.Size(100, 24)
-$turnChk.ForeColor = $ink
-$menuForm.Controls.Add($turnChk)
-
-$turnCloseBox = New-Object System.Windows.Forms.NumericUpDown
-$turnCloseBox.Minimum = 0; $turnCloseBox.Maximum = 60
-$turnCloseBox.Value = [decimal]$script:cfg.turnCostCloseSec
-$turnCloseBox.Location = New-Object System.Drawing.Point(120, 179); $turnCloseBox.Size = New-Object System.Drawing.Size(52, 24)
-$menuForm.Controls.Add($turnCloseBox)
-$turnCloseLbl = New-MenuLabel '秒后自动关' 176 180 80
-
-$menuForm.Add_Deactivate({ $menuForm.Hide() })
-
-function Show-Menu {
-  $b = $script:baseSize
-  $btnTop = [int]($MENU_BTN_TOP * $b) + 4
-  $x = if ($script:flipTarget -lt 0) { $form.Left + 4 } else { $form.Left + $b - $menuForm.Width - 4 }
-  $y = $form.Top + $btnTop - $menuForm.Height - 6
-  if ($y -lt 0) { $y = $form.Top + $btnTop + 30 }
-  $menuForm.Location = New-Object System.Drawing.Point($x, $y)
-  $menuForm.Show()
-  $menuForm.BringToFront()
-}
-
-$scaleBar.add_ValueChanged({ $script:cfg.scale = $scaleBar.Value / 10.0; $script:baseSize = Get-BaseSize; Save-Config; Resize-Window; Update-Surface })
-$scaleBox.add_ValueChanged({
-  $v = [Math]::Max(1, [Math]::Min(20, [int]$scaleBox.Value))
-  $script:cfg.scale = $MIN_SCALE + ($v - 1) * ($MAX_SCALE - $MIN_SCALE) / 19.0
-  $scaleBar.Value = [int][Math]::Round($script:cfg.scale * 10)
-  $script:baseSize = Get-BaseSize; Save-Config; Resize-Window; Update-Surface
-})
-$soundBox.add_SelectedIndexChanged({ $script:cfg.soundSet = if ($soundBox.SelectedIndex -eq 1) { 'fx1' } else { 'duck' }; Save-Config })
-$soundChk.add_CheckedChanged({ $script:cfg.sound = $soundChk.Checked; Save-Config })
-$volBar.add_ValueChanged({ $script:cfg.vol = $volBar.Value / 100.0; $volPct.Text = "$($volBar.Value)%"; Save-Config })
-$usageBox.add_SelectedIndexChanged({ $script:cfg.usageMode = if ($usageBox.SelectedIndex -eq 1) { 'token' } else { 'ledger' }; Save-Config })
-$bubbleChk.add_CheckedChanged({ $script:cfg.bubbleOn = $bubbleChk.Checked; Save-Config; if (-not $bubbleChk.Checked) { Hide-Bubble } })
-$turnChk.add_CheckedChanged({ $script:cfg.turnCostOn = $turnChk.Checked; Save-Config })
-$turnCloseBox.add_ValueChanged({ $script:cfg.turnCostCloseSec = [int]$turnCloseBox.Value; Save-Config })
-
-function Resize-Window {
-  $b = $script:baseSize
-  $maxX = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Right - $b
-  $maxY = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Bottom - $b
-  $x = [Math]::Max(0, [Math]::Min($maxX, $form.Left))
-  $y = [Math]::Max(0, [Math]::Min($maxY, $form.Top))
-  $form.Size = New-Object System.Drawing.Size($b, $b)
-  $form.Location = New-Object System.Drawing.Point($x, $y)
-  $script:cfg.x = $x; $script:cfg.y = $y
-}
 
 # ---------------------------------------------------------------------------
 # 鼠标交互
@@ -1555,21 +1567,12 @@ function Open-UsagePanel {
   }
 }
 
-function Get-MenuButtonRect {
-  $b = $script:baseSize
-  $top = [int]($MENU_BTN_TOP * $b) + 4
-  $left = if ($script:flipAnim -lt 0) { 4 } else { $b - 30 }
-  return New-Object System.Drawing.Rectangle $left, $top, 26, 26
-}
-
 $form.Add_MouseDown({
   param($sender, $e)
   if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { Open-UsagePanel; return }
   if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
-  if (Get-MenuButtonRect.Contains($e.Location)) { Show-Menu; return }
   $script:dragging = $false
   $script:dragOrigin = $e.Location
-  $script:menuBtnHit = $false
   Start-Bounce -X 1.05 -Y 0.88
   Play-Sound 'press'
 })
@@ -1721,35 +1724,52 @@ $stopTimer.add_Tick({
 })
 $stopTimer.Start()
 
-# 跟随 Codex：只有带 -FollowCodex 启动（也就是由 Codex 的 MCP 服务拉起来）时才生效。
-# Codex 一退出就自己收起，所以不需要注册任何开机自启 —— 开机时 Codex 没开，
-# 这个挂件也就不会出现；等 Codex 真的打开时，它的 MCP 服务会负责把挂件放出来。
+# 跟随 Codex 启停：始终盯着 Codex 进程（不再依赖启动参数，否则从快捷方式启动的挂件
+# 永远收不掉）。判定规则只用进程存在性，和"有没有请求"无关，所以 Codex 空闲时不会被误判：
+#   · 见过 Codex 运行 → 之后连续 3 次（约 12 秒）找不到就优雅收起
+#   · 从没见过 Codex（用户在 Codex 没开时手动放出）→ 保持运行，不误杀
+# 不需要注册任何开机自启：开机时 Codex 没开，挂件也就不会出现；
+# Codex 打开时会由插件的 MCP 服务把它放出来。
 $CODEX_POLL_MS = 4000
 $CODEX_MISS_LIMIT = 3      # 连续 3 次（约 12 秒）都找不到 Codex 才收，避免误判
 $script:codexMiss = 0
+$script:codexSeen = $false # 是否见过 Codex 在跑（区分"手动独立启动"与"Codex 退出"）
+
+function Get-CodexStartTime {
+  $procs = Get-Process -Name $CodexProcessName -ErrorAction SilentlyContinue
+  if (-not $procs) { return $null }
+  $earliest = $null
+  foreach ($p in $procs) {
+    try {
+      if ($p.Path -like $CodexPathFilter) {
+        $t = $p.StartTime
+        if ($null -eq $earliest -or $t -lt $earliest) { $earliest = $t }
+      }
+    } catch { }
+  }
+  return $earliest
+}
 
 function Test-CodexRunning {
-  $procs = Get-Process -Name $CodexProcessName -ErrorAction SilentlyContinue
-  if (-not $procs) { return $false }
-  foreach ($p in $procs) {
-    try { if ($p.Path -like $CodexPathFilter) { return $true } } catch { }
-  }
-  return $false
+  return ($null -ne (Get-CodexStartTime))
 }
 
 $codexTimer = New-Object System.Windows.Forms.Timer
 $codexTimer.Interval = $CODEX_POLL_MS
 $codexTimer.add_Tick({
   if ($script:closing) { return }
-  if (Test-CodexRunning) { $script:codexMiss = 0; return }
+  if (Test-CodexRunning) { $script:codexSeen = $true; $script:codexMiss = 0; return }
+  if (-not $script:codexSeen) { return }   # 从来没见 Codex 跑过：独立启动，别收
   $script:codexMiss++
   if ($script:codexMiss -ge $CODEX_MISS_LIMIT) {
-    Write-Log "连续 $($script:codexMiss) 次检测不到 Codex，自动收起挂件"
+    Write-Log "Codex 已退出（连续 $($script:codexMiss) 次检测不到），自动收起挂件"
     $script:closing = $true
     $form.Close()
   }
 })
-if ($FollowCodex) { $codexTimer.Start() }
+# followCodex=false = 完全手动模式：既不随 Codex 自动放出，也不会在 Codex 退出时被收掉
+if ($script:cfg.followCodex) { $codexTimer.Start() }
+else { Write-Log 'followCodex=false：不跟随 Codex 启停（手动模式）' }
 
 # ---------------------------------------------------------------------------
 # 启动
@@ -1803,6 +1823,16 @@ $form.add_QuitHotkeyPressed({
   param($sender, $e)
   if ($script:closing) { return }        # 已经在退出了，避免重复执行
   Write-Log '收到 Ctrl+Shift+Z，退出挂件'
+  # 记下"这是用户主动关的"：这样即使马上又有一个 Codex 会话拉起 MCP 服务，也不会立刻把挂件弹回来。
+  # 等 Codex 下次重新启动（进程启动时间变了）才恢复自动放出。
+  try {
+    $cx = Get-CodexStartTime
+    $payload = [pscustomobject]@{
+      at         = (Get-Date).ToString('o')
+      codexStart = if ($cx) { $cx.ToString('o') } else { $null }
+    }
+    [System.IO.File]::WriteAllText($userStopFile, ($payload | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
   $script:closing = $true
   $form.Close()
 })
@@ -1867,6 +1897,24 @@ if ($TestOpenPanel) {
 
 # 写下自己的 pid：跟随脚本 / CLI 都靠 widget.pid 判断挂件是否在运行。
 # （放在 RenderOnly 之后，这样 -RenderOnly 调试不会覆盖正在运行的挂件的 pid）
+# 启动前先看"用户主动停止"记号：如果这次 Codex 运行期间你已经用 Ctrl+Shift+Z 关掉过，
+# 就不要因为新会话拉起 MCP 又把它弹回来；等 Codex 下次重启（启动时间变了）再恢复。
+if ($script:cfg.followCodex) {
+  try {
+    if (Test-Path -LiteralPath $userStopFile) {
+      $marker = Get-Content -LiteralPath $userStopFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      $cx = Get-CodexStartTime
+      if ($cx -and $marker.codexStart) {
+        $mx = $null
+        try { $mx = [datetime]::Parse([string]$marker.codexStart) } catch { }
+        if ($mx -and $mx -eq $cx) {
+          Write-Log '本次 Codex 运行中你已用 Ctrl+Shift+Z 关掉挂件，跳过自动启动（Codex 重启后恢复）'
+          exit 0
+        }
+      }
+    }
+  } catch { }
+}
 try { [System.IO.File]::WriteAllText($pidFile, "$PID", (New-Object System.Text.UTF8Encoding($false))) } catch { }
 
 # 捕获未处理异常并写进日志，避免只留一个 Windows 崩溃对话框

@@ -44,7 +44,7 @@ function widgetPid(dataDir) {
   }
 }
 
-function startWidget({ dataDir, assetDir, quiet, follow }) {
+function startWidget({ dataDir, assetDir, quiet }) {
   const dir = resolveDataDir(dataDir);
   const existing = widgetPid(dir);
   if (existing) return { started: false, pid: existing, reason: "已在运行" };
@@ -57,8 +57,6 @@ function startWidget({ dataDir, assetDir, quiet, follow }) {
   let cmdline = `powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${WIDGET}" -DataDir "${dir}"`;
   if (assetDir) cmdline += ` -AssetDir "${assetDir}"`;
   if (quiet) cmdline += " -Quiet";
-  // -FollowCodex：挂件自己盯着 Codex 进程，Codex 退出后自动收起
-  if (follow) cmdline += " -FollowCodex";
 
   const script =
     `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${
@@ -189,11 +187,14 @@ const TOOLS = [
     handler: async (args) => {
       const turn = readLastTurn(resolveDataDir(args.dataDir));
       if (!turn) return { error: "还没读到会话记录" };
+      const rate = turn.cacheHitRate === null ? "—" : `${turn.cacheHitRate}%`;
+      const threadRate = turn.threadCacheHitRate === null ? "—" : `${turn.threadCacheHitRate}%`;
       return {
         text:
           `上一轮消耗：${formatMoney(turn.amount, "CNY")}\n` +
           `模型：${turn.model ?? "未知"}\n` +
-          `缓存命中 ${turn.tokens.hit} / 未命中 ${turn.tokens.miss} / 输出 ${turn.tokens.out}`,
+          `缓存命中 ${turn.tokens.hit} / 未命中 ${turn.tokens.miss} / 输出 ${turn.tokens.out}\n` +
+          `本轮命中率：${rate}　本会话命中率：${threadRate}`,
         structured: turn,
       };
     },
@@ -298,7 +299,7 @@ function logMcp(dir, message) {
 
 // Codex 每个会话都会拉起这个 MCP 服务，"服务被启动"就是"Codex 打开了"的天然信号。
 // 所以这里不需要注册任何开机自启：只有 Codex 真的开着才放出挂件。
-// 挂件带 -FollowCodex，Codex 退出后它会自己收起。
+// 挂件自己始终盯着 Codex 进程，Codex 退出后会优雅收起（见 whale.ps1 的 codexTimer）。
 function ensureWidgetForCodex() {
   try {
     const dir = resolveDataDir();
@@ -307,7 +308,7 @@ function ensureWidgetForCodex() {
       return;
     }
     if (widgetPid(dir)) return; // 已经在跑了
-    const r = startWidget({ dataDir: dir, follow: true });
+    const r = startWidget({ dataDir: dir });
     logMcp(dir, r.started ? `已放出挂件 pid=${r.pid}` : `未启动：${r.reason ?? "已在运行"}`);
   } catch (error) {
     try {

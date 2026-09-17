@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "DeepSeek 小鲸鱼挂件",
     "shortDescription": "屏幕角落的小鲸鱼，盯着你的 DeepSeek 余额与消耗",
-    "longDescription": "把 DSH 版「DeepSeek-Balance-Whale-Widget」的外观与交互搬到 Windows 桌面：小鲸鱼立绘 + 代码绘制的对话气泡，显示账户余额、今日已用与每轮对话消耗。支持拖拽、四边四分之一吸附、左吸附镜像翻转、按压 Q 弹、余额数字滚动、随机台词气泡、gif 动图与音效，以及汉堡菜单（大小 / 音效 / 音量 / 用量模式 / 气泡开关）。每轮消耗直接读 Codex 会话日志里的真实 usage，按 DeepSeek 官方峰谷单价换算，不是估算。立绘、gif 与音效沿用上游 MIT 许可的原始素材。",
+    "longDescription": "把 B 站 UP 主月匠的小鲸鱼余额挂件搬到 Windows 桌面，并做成 Codex 插件：小鲸鱼立绘 + 代码绘制的对话气泡，显示账户余额、今日已用、本轮缓存命中率与每轮对话消耗。支持拖拽、四边四分之一吸附、左吸附镜像翻转、按压 Q 弹、余额数字滚动、随机台词气泡、gif 动图与音效。挂件跟着 Codex 启停：Codex 打开时自动出现，Codex 退出后自动收起，Ctrl+Shift+Z 可随时退出挂件（只关挂件，不影响 Codex）。设置改在 config.json 或 CLI，挂件上没有按钮。每轮消耗与缓存命中率直接读 Codex 会话日志里的真实 usage，按 DeepSeek 官方峰谷单价换算，不是估算。立绘、gif 与音效沿用上游 MIT 许可的原始素材。",
     "developerName": "Port of MeteorNOX",
     "category": "Developer Tools",
     "capabilities": [

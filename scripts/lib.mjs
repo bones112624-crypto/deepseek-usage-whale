@@ -400,6 +400,47 @@ function walkRollouts(root, out = []) {
  * 从 Codex 会话日志里读出最近一轮的 token 用量与金额。
  * Codex 每次调用都会写 token_usage_record（真实 usage，非估算）。
  */
+// Codex 正在写哪个会话？~/.codex/thread-writer-locks/<threadId>.lock 只在该会话被
+// 写入期间存在（正在跑一轮），用它锁定"当前正在使用的会话"，比全局最新时间戳可靠。
+function activeThreadIds() {
+  try {
+    const home = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+    return fs
+      .readdirSync(path.join(home, "thread-writer-locks"))
+      .filter((name) => name.endsWith(".lock") && !name.startsWith("."))
+      .map((name) => name.slice(0, -".lock".length))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// 规范化一段 usage（单次请求，或 turn_token_usage / thread_token_usage 聚合）。
+// 字段缺失、或 input <= 0 时返回 null —— 不把"缺失"当成 0%，免得错显成 0% 命中率；
+// cached 做安全截断，保证命中率不会超过 100%。
+function tokenAgg(usage) {
+  if (!usage) return null;
+  const input = Number(usage.input_tokens);
+  const cached = Number(usage.cached_input_tokens);
+  if (!Number.isFinite(input) || !Number.isFinite(cached) || input <= 0) return null;
+  const clamped = Math.min(Math.max(cached, 0), input);
+  return {
+    input,
+    cached: clamped,
+    miss: input - clamped,
+    out: Number(usage.output_tokens ?? 0),
+    reason: Number(usage.reasoning_output_tokens ?? 0),
+    rate: (100 * clamped) / input,
+  };
+}
+
+function threadIdOfFile(file) {
+  const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/.exec(
+    path.basename(file),
+  );
+  return m ? m[1] : null;
+}
+
 export function readLastTurn(dataDir, { limit = 40 } = {}) {
   const root = sessionsRoot();
   if (!root) return null;
@@ -407,15 +448,17 @@ export function readLastTurn(dataDir, { limit = 40 } = {}) {
   if (files.length === 0) return null;
   files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
 
-  const records = [];
-  let liveModel = null;
-  for (const file of files.slice(0, 3)) {
+  const active = activeThreadIds();
+  let best = null;
+  for (const file of files.slice(0, 6)) {
     let text;
     try {
       text = fs.readFileSync(file, "utf8");
     } catch {
       continue;
     }
+    let liveModel = null;
+    let latest = null;
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -430,52 +473,94 @@ export function readLastTurn(dataDir, { limit = 40 } = {}) {
       } else if (event?.type === "session_meta") {
         liveModel = event.payload?.base_instructions?.provenance?.model ?? liveModel;
       } else if (event?.type === "token_usage_record") {
-        const usage = event.payload?.usage ?? {};
-        const input = Number(usage.input_tokens ?? 0);
-        const cached = Number(usage.cached_input_tokens ?? 0);
-        const output = Number(usage.output_tokens ?? 0);
-        if (input + output <= 0) continue;
-        records.push({
-          ts: event.timestamp,
-          turn: event.payload?.turn_id ?? null,
-          model: liveModel,
-          hit: cached,
-          miss: Math.max(0, input - cached),
-          out: output,
-          reasoning: Number(usage.reasoning_output_tokens ?? 0),
-        });
+        latest = { event, model: liveModel };
       }
     }
+    if (!latest) continue;
+    const payload = latest.event.payload ?? {};
+    const threadId = payload.thread_id ?? threadIdOfFile(file);
+    const cand = {
+      file,
+      model: latest.model,
+      ts: latest.event.timestamp,
+      turn: payload.turn_id ?? null,
+      threadId,
+      turnAgg: tokenAgg(payload.turn_token_usage),
+      threadAgg: tokenAgg(payload.thread_token_usage),
+      isActive: Boolean(threadId && active.includes(threadId)),
+      text,
+    };
+    // 优先"Codex 正在写的那个会话"；没有锁时退回时间戳最新者
+    if (!best) {
+      best = cand;
+    } else if (cand.isActive && !best.isActive) {
+      best = cand;
+    } else if (cand.isActive === best.isActive && Date.parse(cand.ts) > Date.parse(best.ts)) {
+      best = cand;
+    }
   }
-  if (records.length === 0) return null;
-  records.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  if (!best) return null;
 
-  const last = records[records.length - 1];
-  const turnId = last.turn;
-  const sameTurn = records.filter((r) => r.turn === turnId);
-  const sum = sameTurn.reduce(
-    (acc, r) => ({
-      hit: acc.hit + r.hit,
-      miss: acc.miss + r.miss,
-      out: acc.out + r.out + r.reasoning,
-    }),
-    { hit: 0, miss: 0, out: 0 },
-  );
-  const amount = costOf({ model: last.model, ...sum, at: last.ts });
+  // 该轮的逐条记录：只在拿不到 turn_token_usage 时作为兜底口径
+  const sum = { hit: 0, miss: 0, out: 0 };
+  let count = 0;
+  for (const line of best.text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes('"token_usage_record"')) continue;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (event?.type !== "token_usage_record") continue;
+    if ((event.payload?.turn_id ?? null) !== best.turn) continue;
+    const agg = tokenAgg(event.payload?.usage);
+    if (!agg) continue;
+    sum.hit += agg.cached;
+    sum.miss += agg.miss;
+    sum.out += agg.out + agg.reason;
+    count += 1;
+  }
+  if (count === 0) return null;
+
+  // 优先用 Codex 自己算好的本轮累计（turn_token_usage）
+  const totals = best.turnAgg
+    ? {
+        hit: best.turnAgg.cached,
+        miss: best.turnAgg.miss,
+        out: best.turnAgg.out + best.turnAgg.reason,
+        rate: best.turnAgg.rate,
+        source: "turn_token_usage",
+      }
+    : {
+        hit: sum.hit,
+        miss: sum.miss,
+        out: sum.out,
+        rate: sum.hit + sum.miss > 0 ? (100 * sum.hit) / (sum.hit + sum.miss) : null,
+        source: "sum(usage)",
+      };
+  const amount = costOf({ model: best.model, hit: totals.hit, miss: totals.miss, out: totals.out, at: best.ts });
 
   const file = paths(dataDir).cost;
   const prev = readJson(file, null);
-  const seq = prev && prev.turn === turnId ? Number(prev.seq ?? 0) : Number(prev?.seq ?? 0) + 1;
+  const seq = prev && prev.turn === best.turn ? Number(prev.seq ?? 0) : Number(prev?.seq ?? 0) + 1;
   const payload = {
     ok: true,
     seq,
-    turn: turnId,
+    turn: best.turn,
     amount: Number(amount.toFixed(6)),
-    model: last.model,
-    tokens: { hit: sum.hit, miss: sum.miss, out: sum.out },
-    ts: last.ts,
+    model: best.model,
+    tokens: { hit: totals.hit, miss: totals.miss, out: totals.out },
+    // 命中率：本轮 / 本会话；数据缺失时是 null（调用方显示 "—"，不要当成 0%）
+    cacheHitRate: totals.rate === null ? null : Number(totals.rate.toFixed(2)),
+    threadCacheHitRate: best.threadAgg ? Number(best.threadAgg.rate.toFixed(2)) : null,
+    rateSource: totals.source,
+    threadId: best.threadId ?? null,
+    isActiveThread: best.isActive,
+    ts: best.ts,
   };
-  if (!prev || prev.turn !== turnId || prev.amount !== payload.amount) {
+  if (!prev || prev.turn !== best.turn || prev.amount !== payload.amount) {
     writeJson(file, payload);
   }
   return payload;
